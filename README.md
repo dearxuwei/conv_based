@@ -8,7 +8,7 @@ This repository contains several neural network models for steady-state visual e
 - **`convca_read_djl.py`** – Data loader for an alternative DJL dataset with similar preprocessing routines.
 - **`CONVCA.py`** – Implementation of the `ConvCA` model that extracts features via time‑domain convolutions and computes correlations with template and reference signals.
 - **`FFCA.py`** – Defines `FFTCA`, a variant where the time‑domain convolutions are replaced by learnable frequency‑domain filtering.
-- **`ConvFFTCA.py`** – A hybrid model combining time‑domain and frequency‑domain branches using Squeeze‑and‑Excitation fusion.
+- **`ConvFFTCA.py`** – Contains the SE fusion model `ConvFFTCA_SE` and the improved `ConvFFTCA_Parallel` variant with dynamic gating between time-/frequency-domain correlations.
 - **`main_CONCA.py`**, **`main_FFCA.py`**, **`main_ConvFFCA.py`** – Example scripts that perform leave‑one‑subject‑out experiments on the Benchmark dataset using the corresponding models.
 
 ## Usage
@@ -19,6 +19,7 @@ This repository contains several neural network models for steady-state visual e
    python main_CONCA.py      # ConvCA model
    python main_FFCA.py       # FFTCA model
    python main_ConvFFCA.py   # ConvFFTCA‑SE model
+   # ConvFFTCA_Parallel can be imported for custom experiments
    ```
    Each script will iterate through all subjects, split runs into training and testing sessions, and output accuracy logs under the specified result directory.
 

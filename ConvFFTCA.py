@@ -57,16 +57,26 @@ class FreqBranch(nn.Module):
 
 # ---------------- 3. SE 融合 ----------------
 class SEFusion(nn.Module):
-    def __init__(self, reduction:int=2):
-        super().__init__()
-        self.fc1 = nn.Linear(2, 2//reduction, bias=False)
-        self.fc2 = nn.Linear(2//reduction, 2, bias=False)
+    """Squeeze-and-Excitation 融合块，可返回权重或加权特征"""
 
-    def forward(self, xt, xf):                  # (B,1,T,1) x2
-        x = torch.cat([xt, xf], dim=1)          # (B,2,T,1)
-        s = x.mean(dim=[2,3])                   # (B,2)
-        w = torch.sigmoid(self.fc2(F.gelu(self.fc1(s)))).view(-1,2,1,1)
-        return (x * w).sum(dim=1, keepdim=True) # (B,1,T,1)
+    def __init__(self, reduction: int = 2):
+        super().__init__()
+        self.fc1 = nn.Linear(2, 2 // reduction, bias=False)
+        self.fc2 = nn.Linear(2 // reduction, 2, bias=False)
+
+    def forward(self, xt: torch.Tensor, xf: torch.Tensor, *, return_weight: bool = False):
+        """融合两个特征图
+
+        Args:
+            xt, xf: shape = (B, 1, T, 1)
+            return_weight: 若为 ``True``，则仅返回权重 ``(B,2,1,1)``
+        """
+        x = torch.cat([xt, xf], dim=1)  # (B,2,T,1)
+        s = x.mean(dim=[2, 3])          # (B,2)
+        w = torch.sigmoid(self.fc2(F.gelu(self.fc1(s)))).view(-1, 2, 1, 1)
+        if return_weight:
+            return w
+        return (x * w).sum(dim=1, keepdim=True)
 
 # ---------------- 4. 完整模型 ----------------
 class ConvFFTCA_SE(nn.Module):
@@ -106,6 +116,76 @@ class ConvFFTCA_SE(nn.Module):
 
         return self.fc(corr)                                 # (B,40)
 
+# ----------------------------------------------------------------------
+# 新版并行相关模型：ConvFFTCA_Parallel
+# ----------------------------------------------------------------------
+class CorrGateFusion(nn.Module):
+    """对相关向量进行动态门控融合"""
+
+    def __init__(self, dim: int = 40, hidden: int = 40):
+        super().__init__()
+        self.fc1 = nn.Linear(dim * 2, hidden)
+        self.fc2 = nn.Linear(hidden, dim)
+
+    def forward(
+        self, ct: torch.Tensor, cf: torch.Tensor, *, return_weight: bool = False
+    ) -> torch.Tensor:
+        """门控加权 ``ct`` 与 ``cf`` 并输出融合结果"""
+        w = torch.sigmoid(self.fc2(F.gelu(self.fc1(torch.cat([ct, cf], dim=1)))))
+        if return_weight:
+            return w * ct + (1 - w) * cf, w
+        return w * ct + (1 - w) * cf
+
+
+class ConvFFTCA_Parallel(nn.Module):
+    """在相关计算阶段并行融合时域/频域特征"""
+
+    def __init__(self, T: int = 150, C: int = 9, D: int = 16):
+        super().__init__()
+        self.time = ConvBranch(C, T)
+        self.freq = FreqBranch(C, T, D)
+        self.fuse = SEFusion()
+        self.gate = CorrGateFusion()
+        self.flat = nn.Flatten(start_dim=2)
+
+        self.conv21 = nn.Conv2d(C, 40, (9,1), padding='same')
+        self.conv22 = nn.Conv2d(40, 1, (9,1), padding='same')
+        self.drop2  = nn.Dropout(0.15)
+
+        self.conv31 = nn.Conv2d(C+1, 40, (9,1), padding='same')
+        self.conv32 = nn.Conv2d(40, 1, (9,1), padding='same')
+        self.drop3  = nn.Dropout(0.15)
+
+        self.alpha = nn.Parameter(torch.tensor(0.5))
+        self.fc    = nn.Linear(40, 40)
+
+    @staticmethod
+    def _corr(sig: torch.Tensor, tpl: torch.Tensor):
+        xt = torch.bmm(sig, tpl)
+        xx = torch.bmm(sig, sig.transpose(1, 2))
+        tt = torch.sum(tpl * tpl, dim=1)
+        return xt.squeeze(1) / torch.sqrt(xx.squeeze(1)) / torch.sqrt(tt)
+
+    def forward(
+        self, signal: torch.Tensor, temp: torch.Tensor, ref: torch.Tensor
+    ) -> torch.Tensor:
+        xt = self.time(signal)                      # (B,1,T,1)
+        xf = self.freq(signal)                      # (B,1,T,1)
+        w_feat = self.fuse(xt, xf, return_weight=True)  # (B,2,1,1)
+
+        xt = self.flat(xt * w_feat[:, 0])
+        xf = self.flat(xf * w_feat[:, 1])
+
+        tfeat = self.drop2(self.conv22(self.conv21(temp))).squeeze()  # (B,T,40)
+        rfeat = self.drop3(self.conv32(self.conv31(ref))).squeeze()   # (B,T,40)
+
+        corr_t = self.alpha * self._corr(xt, tfeat) + (1 - self.alpha) * self._corr(xt, rfeat)
+        corr_f = self.alpha * self._corr(xf, tfeat) + (1 - self.alpha) * self._corr(xf, rfeat)
+
+        corr = self.gate(corr_t, corr_f)
+
+        return self.fc(corr)
+
 # ---------------- 5. 可视化示例函数 ----------------
 def plot_history(log_dict, png="curve.png"):
     import matplotlib.pyplot as plt
@@ -124,10 +204,15 @@ def plot_confmat(cm, classes, png="cm.png"):
 
 # ---------------- 6. 快速自检 ----------------
 if __name__ == "__main__":
-    B,T,C,K = 4,150,9,40
-    net = ConvFFTCA_SE(T,C)
-    sig = torch.randn(B,1,T,C)
-    tpl = torch.randn(B,C,T,K)
-    ref = torch.randn(B,C+1,T,K)
-    out = net(sig,tpl,ref)
-    print("Test forward OK, logits:", out.shape)
+    B, T, C, K = 4, 150, 9, 40
+    sig = torch.randn(B, 1, T, C)
+    tpl = torch.randn(B, C, T, K)
+    ref = torch.randn(B, C + 1, T, K)
+
+    net1 = ConvFFTCA_SE(T, C)
+    out1 = net1(sig, tpl, ref)
+    print("SE fusion logits:", out1.shape)
+
+    net2 = ConvFFTCA_Parallel(T, C)
+    out2 = net2(sig, tpl, ref)
+    print("Parallel fusion logits:", out2.shape)
