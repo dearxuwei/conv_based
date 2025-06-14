@@ -119,6 +119,24 @@ class ConvFFTCA_SE(nn.Module):
 # ----------------------------------------------------------------------
 # 新版并行相关模型：ConvFFTCA_Parallel
 # ----------------------------------------------------------------------
+class CorrGateFusion(nn.Module):
+    """对相关向量进行动态门控融合"""
+
+    def __init__(self, dim: int = 40, hidden: int = 40):
+        super().__init__()
+        self.fc1 = nn.Linear(dim * 2, hidden)
+        self.fc2 = nn.Linear(hidden, dim)
+
+    def forward(
+        self, ct: torch.Tensor, cf: torch.Tensor, *, return_weight: bool = False
+    ) -> torch.Tensor:
+        """门控加权 ``ct`` 与 ``cf`` 并输出融合结果"""
+        w = torch.sigmoid(self.fc2(F.gelu(self.fc1(torch.cat([ct, cf], dim=1)))))
+        if return_weight:
+            return w * ct + (1 - w) * cf, w
+        return w * ct + (1 - w) * cf
+
+
 class ConvFFTCA_Parallel(nn.Module):
     """在相关计算阶段并行融合时域/频域特征"""
 
@@ -127,6 +145,7 @@ class ConvFFTCA_Parallel(nn.Module):
         self.time = ConvBranch(C, T)
         self.freq = FreqBranch(C, T, D)
         self.fuse = SEFusion()
+        self.gate = CorrGateFusion()
         self.flat = nn.Flatten(start_dim=2)
 
         self.conv21 = nn.Conv2d(C, 40, (9,1), padding='same')
@@ -161,6 +180,7 @@ class ConvFFTCA_Parallel(nn.Module):
         corr_t = self.alpha * self._corr(xt, tfeat) + (1 - self.alpha) * self._corr(xt, rfeat)
         corr_f = self.alpha * self._corr(xf, tfeat) + (1 - self.alpha) * self._corr(xf, rfeat)
 
+        corr = self.gate(corr_t, corr_f)
         corr = w[:,0,0,0].unsqueeze(1) * corr_t + w[:,1,0,0].unsqueeze(1) * corr_f
 
         return self.fc(corr)
