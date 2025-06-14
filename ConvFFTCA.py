@@ -166,15 +166,13 @@ class ConvFFTCA_Parallel(nn.Module):
         tt = torch.sum(tpl * tpl, dim=1)
         return xt.squeeze(1) / torch.sqrt(xx.squeeze(1)) / torch.sqrt(tt)
 
-    def forward(
-        self, signal: torch.Tensor, temp: torch.Tensor, ref: torch.Tensor
-    ) -> torch.Tensor:
+    def forward(self, signal: torch.Tensor, temp: torch.Tensor, ref: torch.Tensor):
         xt = self.time(signal)                      # (B,1,T,1)
         xf = self.freq(signal)                      # (B,1,T,1)
-        w_feat = self.fuse(xt, xf, return_weight=True)  # (B,2,1,1)
+        w  = self.fuse(xt, xf, return_weight=True)  # (B,2,1,1)
 
-        xt = self.flat(xt * w_feat[:, 0])
-        xf = self.flat(xf * w_feat[:, 1])
+        xt = self.flat(xt)  # (B,1,T)
+        xf = self.flat(xf)
 
         tfeat = self.drop2(self.conv22(self.conv21(temp))).squeeze()  # (B,T,40)
         rfeat = self.drop3(self.conv32(self.conv31(ref))).squeeze()   # (B,T,40)
@@ -183,6 +181,7 @@ class ConvFFTCA_Parallel(nn.Module):
         corr_f = self.alpha * self._corr(xf, tfeat) + (1 - self.alpha) * self._corr(xf, rfeat)
 
         corr = self.gate(corr_t, corr_f)
+        corr = w[:,0,0,0].unsqueeze(1) * corr_t + w[:,1,0,0].unsqueeze(1) * corr_f
 
         return self.fc(corr)
 
